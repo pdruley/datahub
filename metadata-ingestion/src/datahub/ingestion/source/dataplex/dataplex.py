@@ -352,6 +352,7 @@ class DataplexSource(Source):
                         if not self.config.filter_config.zone_pattern.allowed(zone_id):
                             continue
 
+                        # Create Domain for this lake (parent domain for zones)
                         lake_domain_urn = make_lake_domain_urn(project_id, lake_id)
                         yield MetadataChangeProposalWrapper(
                             entityUrn=lake_domain_urn,
@@ -367,14 +368,12 @@ class DataplexSource(Source):
 
                         # Create Domain for this zone (required for Data Products)
                         # Each zone gets its own domain to contain assets (Data Products)
-                        # We need to fetch zone details to get metadata for the domain
                         zone_domain_urn = make_zone_domain_urn(
                             project_id=project_id,
                             lake_id=lake_id,
                             zone_id=zone_id,
                         )
 
-                        # Get zone details for domain creation
                         try:
                             # Create Domain entity with properties
                             yield MetadataChangeProposalWrapper(
