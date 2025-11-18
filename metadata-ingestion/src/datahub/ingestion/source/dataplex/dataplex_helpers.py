@@ -89,10 +89,35 @@ def make_zone_container_key(
     )
 
 
+def make_lake_domain_urn(project_id: str, lake_id: str) -> str:
+    """Create domain URN for a Dataplex lake."""
+    domain_id = f"{project_id}.{lake_id}"
+    return builder.make_domain_urn(domain_id)
+
+
+def make_zone_domain_urn(project_id: str, lake_id: str, zone_id: str) -> str:
+    """Create domain URN for a Dataplex zone.
+
+    Domains are required for Data Products. Each zone gets its own domain
+    to contain the assets (Data Products) within that zone.
+
+    Args:
+        project_id: The GCP project ID
+        lake_id: The Dataplex lake ID
+        zone_id: The Dataplex zone ID
+
+    Returns:
+        The domain URN for the zone
+    """
+    # Use a composite key to ensure uniqueness across projects/lakes
+    domain_id = f"{project_id}.{lake_id}.{zone_id}"
+    return builder.make_domain_urn(domain_id)
+
+
 def make_asset_data_product_urn(
     project_id: str, lake_id: str, zone_id: str, asset_id: str
 ) -> str:
-    """Create URN for a assewt as a data product."""
+    """Create URN for an asset as a data product."""
     return builder.make_data_product_urn(f"{project_id}.{lake_id}.{zone_id}.{asset_id}")
 
 

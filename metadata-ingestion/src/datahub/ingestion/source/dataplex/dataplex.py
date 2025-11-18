@@ -38,9 +38,11 @@ from datahub.ingestion.source.dataplex.dataplex_helpers import (
     make_audit_stamp,
     make_entity_dataset_urn,
     make_lake_container_key,
+    make_lake_domain_urn,
     make_project_container_key,
     make_source_dataset_urn,
     make_zone_container_key,
+    make_zone_domain_urn,
     map_dataplex_field_to_datahub,
 )
 from datahub.ingestion.source.dataplex.dataplex_report import DataplexReport
@@ -48,8 +50,11 @@ from datahub.metadata.com.linkedin.pegasus2avro.common import Siblings
 from datahub.metadata.schema_classes import (
     ContainerClass,
     DataPlatformInstanceClass,
+    DataProductAssociationClass,
     DataProductPropertiesClass,
     DatasetPropertiesClass,
+    DomainPropertiesClass,
+    DomainsClass,
     OtherSchemaClass,
     RecordTypeClass,
     SchemaFieldClass,
@@ -347,6 +352,56 @@ class DataplexSource(Source):
                         if not self.config.filter_config.zone_pattern.allowed(zone_id):
                             continue
 
+                        lake_domain_urn = make_lake_domain_urn(project_id, lake_id)
+                        yield MetadataChangeProposalWrapper(
+                            entityUrn=lake_domain_urn,
+                            aspect=DomainPropertiesClass(
+                                name=lake.display_name or lake_id,
+                                description=lake.description
+                                or f"Domain for Dataplex lake: {lake_id}",
+                                created=make_audit_stamp(lake.create_time)
+                                if lake.create_time
+                                else None,
+                            ),
+                        )
+
+                        # Create Domain for this zone (required for Data Products)
+                        # Each zone gets its own domain to contain assets (Data Products)
+                        # We need to fetch zone details to get metadata for the domain
+                        zone_domain_urn = make_zone_domain_urn(
+                            project_id=project_id,
+                            lake_id=lake_id,
+                            zone_id=zone_id,
+                        )
+
+                        # Get zone details for domain creation
+                        try:
+                            # Create Domain entity with properties
+                            yield MetadataChangeProposalWrapper(
+                                entityUrn=zone_domain_urn,
+                                aspect=DomainPropertiesClass(
+                                    name=zone.display_name or zone_id,
+                                    description=zone.description
+                                    or f"Domain for Dataplex zone: {zone_id}",
+                                    created=make_audit_stamp(zone.create_time)
+                                    if zone.create_time
+                                    else None,
+                                    parentDomain=lake_domain_urn,
+                                ),
+                            )
+                        except exceptions.GoogleAPICallError as e:
+                            logger.warning(
+                                f"Could not fetch zone details for {zone_id}, creating domain with minimal info: {e}"
+                            )
+                            # Create domain with minimal info if we can't fetch zone details
+                            yield MetadataChangeProposalWrapper(
+                                entityUrn=zone_domain_urn,
+                                aspect=DomainPropertiesClass(
+                                    name=zone_id,
+                                    description=f"Domain for Dataplex zone: {zone_id}",
+                                ),
+                            )
+
                         # List assets in this zone
                         assets_parent = f"projects/{project_id}/locations/{self.config.location}/lakes/{lake_id}/zones/{zone_id}"
                         assets_request = dataplex_v1.ListAssetsRequest(
@@ -382,15 +437,9 @@ class DataplexSource(Source):
                                     project_id, lake_id, zone_id, asset_id
                                 )
 
-                                # Link to parent zone container
-                                zone_container_key = make_zone_container_key(
-                                    project_id=project_id,
-                                    lake_id=lake_id,
-                                    zone_id=zone_id,
-                                    platform=self.platform,
-                                    env=self.config.env,
+                                zone_domain_urn = make_zone_domain_urn(
+                                    project_id, lake_id, zone_id
                                 )
-                                zone_container_urn = zone_container_key.as_urn()
 
                                 yield from MetadataChangeProposalWrapper.construct_many(
                                     entityUrn=data_product_urn,
@@ -399,7 +448,7 @@ class DataplexSource(Source):
                                             name=asset_id,
                                             description=asset.description or "",
                                         ),
-                                        ContainerClass(container=zone_container_urn),
+                                        DomainsClass(domains=[zone_domain_urn]),
                                     ],
                                 )
 
@@ -452,6 +501,10 @@ class DataplexSource(Source):
 
                         if not self.config.filter_config.zone_pattern.allowed(zone_id):
                             continue
+
+                        # Dictionary to collect entities per asset (data product)
+                        # Key: data_product_urn, Value: list of dataset_urns
+                        asset_to_entities: dict[str, list[str]] = {}
 
                         # List entities in this zone
                         entities_parent = f"projects/{project_id}/locations/{self.config.location}/lakes/{lake_id}/zones/{zone_id}"
@@ -585,10 +638,28 @@ class DataplexSource(Source):
                                     ContainerClass(container=zone_container_urn)
                                 )
 
+                                zone_domain_urn = make_zone_domain_urn(
+                                    project_id, lake_id, zone_id
+                                )
+                                aspects.append(DomainsClass(domains=[zone_domain_urn]))
+
                                 yield from MetadataChangeProposalWrapper.construct_many(
                                     entityUrn=dataset_urn,
                                     aspects=aspects,
                                 )
+
+                                # Collect entity for its parent asset (data product)
+                                # We'll update the Data Product after processing all entities
+                                if entity_full.asset:
+                                    asset_id = entity_full.asset
+                                    data_product_urn = make_asset_data_product_urn(
+                                        project_id, lake_id, zone_id, asset_id
+                                    )
+                                    if data_product_urn not in asset_to_entities:
+                                        asset_to_entities[data_product_urn] = []
+                                    asset_to_entities[data_product_urn].append(
+                                        dataset_urn
+                                    )
 
                                 # Create sibling relationship if enabled and source platform is different
                                 if (
@@ -601,6 +672,26 @@ class DataplexSource(Source):
                                         project_id,
                                         source_platform,
                                     )
+
+                            # After processing all entities in this zone, update Data Products
+                            # with all their entities using MetadataChangeProposalWrapper
+                            # Note: This uses UPSERT which will replace all existing assets.
+                            for (
+                                data_product_urn,
+                                dataset_urns,
+                            ) in asset_to_entities.items():
+                                yield MetadataChangeProposalWrapper(
+                                    entityUrn=data_product_urn,
+                                    aspect=DataProductPropertiesClass(
+                                        assets=[
+                                            DataProductAssociationClass(
+                                                destinationUrn=dataset_urn,
+                                                created=make_audit_stamp(None),
+                                            )
+                                            for dataset_urn in dataset_urns
+                                        ]
+                                    ),
+                                )
 
                         except exceptions.GoogleAPICallError as e:
                             self.report.report_failure(
