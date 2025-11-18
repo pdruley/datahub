@@ -29,10 +29,17 @@ import yaml
 
 try:
     from google.api_core import exceptions
+    from google.cloud import dataplex_v1
 
     from datahub.ingestion.api.common import PipelineContext
     from datahub.ingestion.source.dataplex.dataplex import DataplexSource
     from datahub.ingestion.source.dataplex.dataplex_config import DataplexConfig
+    from datahub.ingestion.source.dataplex.dataplex_helpers import (
+        make_asset_data_product_urn,
+        make_entity_dataset_urn,
+        make_lake_domain_urn,
+        make_zone_domain_urn,
+    )
 except ImportError as e:
     print("=" * 80)
     print("ERROR: Required packages not installed")
@@ -71,7 +78,9 @@ class DataplexConnectorTester:
             "lakes": [],
             "zones": [],
             "assets": [],
+            "data_products": [],
             "entities": [],
+            "entity_to_dataproduct_mapping": [],
             "workunits_generated": 0,
             "errors": [],
         }
@@ -308,13 +317,15 @@ class DataplexConnectorTester:
             return False
 
     def test_assets(self) -> bool:
-        """Test asset extraction."""
+        """Test asset extraction and data product creation."""
         if not self.source:
             logger.error("Source not initialized")
             return False
 
         try:
             total_assets = 0
+            total_data_products = 0
+            total_domains = 0
             for project_id in self.source.config.project_ids:
                 logger.info(f"\nScanning assets in project: {project_id}")
 
@@ -331,6 +342,12 @@ class DataplexConnectorTester:
                     ):
                         continue
 
+                    # Track lake domain creation
+                    lake_domain_urn = make_lake_domain_urn(project_id, lake_id)
+                    logger.info(f"\n  Lake: {lake_id}")
+                    logger.info(f"    ✓ Lake Domain URN: {lake_domain_urn}")
+                    total_domains += 1
+
                     zones_parent = f"projects/{project_id}/locations/{self.source.config.location}/lakes/{lake_id}"
                     zones_request = self.source.dataplex_client.list_zones(
                         parent=zones_parent
@@ -344,7 +361,13 @@ class DataplexConnectorTester:
                         ):
                             continue
 
-                        logger.info(f"\n  Lake: {lake_id} / Zone: {zone_id}")
+                        # Track zone domain creation
+                        zone_domain_urn = make_zone_domain_urn(
+                            project_id, lake_id, zone_id
+                        )
+                        logger.info(f"    Zone: {zone_id}")
+                        logger.info(f"      ✓ Zone Domain URN: {zone_domain_urn}")
+                        total_domains += 1
 
                         assets_parent = f"projects/{project_id}/locations/{self.source.config.location}/lakes/{lake_id}/zones/{zone_id}"
                         assets_request = self.source.dataplex_client.list_assets(
@@ -372,6 +395,29 @@ class DataplexConnectorTester:
                                 "filtered": filtered,
                             }
 
+                            # Track data product creation for non-filtered assets
+                            if not filtered:
+                                data_product_urn = make_asset_data_product_urn(
+                                    project_id, lake_id, zone_id, asset_id
+                                )
+                                asset_info["data_product_urn"] = data_product_urn
+                                asset_info["zone_domain_urn"] = zone_domain_urn
+
+                                data_product_info = {
+                                    "urn": data_product_urn,
+                                    "name": asset_id,
+                                    "description": asset.description or "",
+                                    "lake_id": lake_id,
+                                    "zone_id": zone_id,
+                                    "domain_urn": zone_domain_urn,
+                                }
+                                self.results["data_products"].append(data_product_info)
+                                total_data_products += 1
+
+                                logger.info(
+                                    f"      ✓ Data Product URN: {data_product_urn}"
+                                )
+
                             status = "🚫 FILTERED" if filtered else "✅ INCLUDED"
                             resource_type = (
                                 asset.resource_spec.type_.name
@@ -379,12 +425,14 @@ class DataplexConnectorTester:
                                 else "UNKNOWN"
                             )
                             logger.info(
-                                f"    {status} Asset: {asset_id} ({resource_type}) - State: {asset.state}"
+                                f"      {status} Asset: {asset_id} ({resource_type}) - State: {asset.state}"
                             )
                             self.results["assets"].append(asset_info)
                             total_assets += 1
 
             logger.info(f"\n✓ Total assets found: {total_assets}")
+            logger.info(f"✓ Total data products created: {total_data_products}")
+            logger.info(f"✓ Total domains created: {total_domains}")
             return True
         except exceptions.PermissionDenied as e:
             logger.error(f"Permission denied accessing assets: {e}")
@@ -397,13 +445,17 @@ class DataplexConnectorTester:
             return False
 
     def test_entities(self) -> bool:
-        """Test entity extraction."""
+        """Test entity extraction and assignment to data products."""
         if not self.source:
             logger.error("Source not initialized")
             return False
 
         try:
             total_entities = 0
+            total_entities_assigned = 0
+            # Dictionary to track entities per data product across all zones
+            all_asset_to_entities: Dict[str, list] = {}
+
             for project_id in self.source.config.project_ids:
                 logger.info(f"\nScanning entities in project: {project_id}")
 
@@ -446,8 +498,29 @@ class DataplexConnectorTester:
                                 entity_id
                             )
 
+                            # Fetch full entity details to get asset reference
+                            try:
+                                get_entity_request = dataplex_v1.GetEntityRequest(
+                                    name=entity.name,
+                                    view=dataplex_v1.GetEntityRequest.EntityView.FULL,
+                                )
+                                entity_full = self.source.metadata_client.get_entity(
+                                    request=get_entity_request
+                                )
+                            except Exception:
+                                entity_full = entity
+
+                            # Generate dataset URN
+                            dataset_urn = make_entity_dataset_urn(
+                                entity_id,
+                                project_id,
+                                self.source.config.env,
+                                platform="dataplex",
+                            )
+
                             entity_info = {
                                 "id": entity_id,
+                                "dataset_urn": dataset_urn,
                                 "lake_id": lake_id,
                                 "zone_id": zone_id,
                                 "type": entity.type_,
@@ -460,6 +533,41 @@ class DataplexConnectorTester:
                                 "filtered": filtered,
                             }
 
+                            # Track entity assignment to data product
+                            if (
+                                not filtered
+                                and hasattr(entity_full, "asset")
+                                and entity_full.asset
+                            ):
+                                asset_id = entity_full.asset
+                                data_product_urn = make_asset_data_product_urn(
+                                    project_id, lake_id, zone_id, asset_id
+                                )
+                                entity_info["asset_id"] = asset_id
+                                entity_info["data_product_urn"] = data_product_urn
+
+                                # Track in mapping dictionary (matching source logic)
+                                if data_product_urn not in all_asset_to_entities:
+                                    all_asset_to_entities[data_product_urn] = []
+                                all_asset_to_entities[data_product_urn].append(
+                                    dataset_urn
+                                )
+
+                                mapping_info = {
+                                    "entity_id": entity_id,
+                                    "dataset_urn": dataset_urn,
+                                    "asset_id": asset_id,
+                                    "data_product_urn": data_product_urn,
+                                }
+                                self.results["entity_to_dataproduct_mapping"].append(
+                                    mapping_info
+                                )
+                                total_entities_assigned += 1
+
+                                logger.info(
+                                    f"      ✓ Entity {entity_id} → Data Product {data_product_urn}"
+                                )
+
                             status = "🚫 FILTERED" if filtered else "✅ INCLUDED"
                             logger.info(
                                 f"    {status} Entity: {entity_id} ({entity.type_}) - System: {entity.system}"
@@ -468,6 +576,20 @@ class DataplexConnectorTester:
                             total_entities += 1
 
             logger.info(f"\n✓ Total entities found: {total_entities}")
+            logger.info(
+                f"✓ Total entities assigned to data products: {total_entities_assigned}"
+            )
+            logger.info(
+                f"✓ Total data products that will receive entities: {len(all_asset_to_entities)}"
+            )
+
+            # Log detailed summary of entity assignments
+            if all_asset_to_entities:
+                logger.info("\n  Entity-to-DataProduct Assignment Summary:")
+                for dp_urn, entity_urns in all_asset_to_entities.items():
+                    logger.info(
+                        f"    - Data Product {dp_urn}: {len(entity_urns)} entity/entities"
+                    )
             return True
         except exceptions.PermissionDenied as e:
             logger.error(f"Permission denied accessing entities: {e}")
